@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Edge TinyML Pre-Fall Prediction Engine</title>
+<style>
+:root{
+  --bg:#050505; --panel:#0e0e0e; --panel2:#171510; --line:#3a2f12;
+  --text:#f7ecc9; --muted:#a8935a;
+  --x:#ffd700; --y:#b8771a; --z:#fff2b8; --res:#ffffff;
+  --ok:#22c55e; --warn:#ff6a3d; --bad:#ef4444; --info:#d4af37;
+  --font:Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+}
+*{box-sizing:border-box;margin:0}
+body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh}
+header{border-bottom:1px solid #d4af37 !important;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;
+  padding:18px 28px;border-bottom:1px solid var(--line);background:var(--panel)}
+h1{color:#d4af37;font-size:20px;font-weight:700;letter-spacing:-.01em}
+.sub{font-size:12px;color:var(--muted);margin-top:4px}
+.chips{display:flex;gap:8px;flex-wrap:wrap}
+.chip{font-size:11px;padding:5px 10px;border:1px solid var(--line);border-radius:999px;color:var(--muted);background:var(--panel2)}
+.chip b{color:var(--text);font-weight:600}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--ok);margin-right:6px;box-shadow:0 0 8px var(--ok)}
+.dot.live{animation:pulse 1s infinite}
+@keyframes pulse{50%{opacity:.3}}
+.layout{display:grid;grid-template-columns:260px 1fr;gap:20px;padding:20px 28px;max-width:1500px;margin:auto}
+@media(max-width:1000px){.layout{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px}
+.card h2{color:#d4af37;font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:14px;font-weight:600}
+label{display:block;font-size:12px;color:var(--muted);margin:14px 0 6px}
+select,button{width:100%;font:inherit;font-size:13px;border-radius:9px;border:1px solid var(--line);
+  background:var(--panel2);color:var(--text);padding:10px 12px}
+select:focus,button:focus-visible{outline:2px solid var(--info);outline-offset:1px}
+button{margin-top:18px;background:linear-gradient(135deg,#f5d76e,#d4af37 55%,#a67c00);border:0;color:#000;font-weight:700;cursor:pointer;transition:filter .15s}
+button:hover{filter:brightness(1.1)} button:disabled{opacity:.5;cursor:wait}
+.main{display:grid;grid-template-columns:minmax(0,2fr) minmax(280px,1fr);gap:20px}
+@media(max-width:1200px){.main{grid-template-columns:1fr}}
+.chartwrap{position:relative;height:380px}
+canvas{width:100%;height:100%;display:block}
+.legend{display:flex;gap:16px;font-size:12px;color:var(--muted);margin-top:10px;flex-wrap:wrap}
+.legend i{display:inline-block;width:14px;height:3px;border-radius:2px;margin-right:6px;vertical-align:middle}
+.stack{display:flex;flex-direction:column;gap:14px}
+.status{padding:12px 14px;border-radius:10px;font-size:13px;font-weight:600;border:1px solid transparent}
+.status.ok{background:rgba(34,197,94,.1);color:var(--ok);border-color:rgba(34,197,94,.3)}
+.status.bad{background:rgba(239,68,68,.1);color:var(--bad);border-color:rgba(239,68,68,.3)}
+.status.info{background:rgba(212,175,55,.1);color:var(--info);border-color:rgba(212,175,55,.35)}
+.status.idle{background:var(--panel2);color:var(--muted);border-color:var(--line)}
+.meter .row{display:flex;justify-content:space-between;align-items:baseline;font-size:12px;color:var(--muted)}
+.meter .val{font-size:30px;font-weight:600;color:var(--text);font-variant-numeric:tabular-nums}
+.bar{height:6px;background:var(--panel2);border-radius:99px;overflow:hidden;margin-top:6px}
+.bar>div{height:100%;width:0;border-radius:99px;transition:width .25s}
+.alert{display:none;animation:flash .6s 3}
+.alert.show{display:block}
+@keyframes flash{50%{box-shadow:0 0 0 4px rgba(239,68,68,.35)}}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:20px}
+@media(max-width:700px){.kpis{grid-template-columns:repeat(2,1fr)}}
+.kpi{background:var(--panel2);border-radius:10px;padding:12px}
+.kpi small{font-size:11px;color:var(--muted);display:block}
+.kpi span{font-size:18px;font-weight:600;font-variant-numeric:tabular-nums}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Edge TinyML Pre-Fall Prediction Engine</h1>
+    <div class="sub">Hardware-in-the-Loop Software Emulation · 50 Hz IMU Pipeline · INT8 Quantized Model (~19 KB)</div>
+  </div>
+  <div class="chips">
+    <span class="chip">Sensor <b>MPU-6050</b></span>
+    <span class="chip">Window <b>50 samples / 1 s</b></span>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="card" style="align-self:start">
+    <h2>Scenario Configuration</h2>
+    <label for="scenario">Activity scenario</label>
+    <select id="scenario">
+      <option value="fall">Pre-Fall Instability (Loss of Balance)</option>
+      <option value="adl">Normal Activity (Walking / Sit-to-Stand)</option>
+    </select>
+    <label for="sample">Test window sample</label>
+    <select id="sample"></select>
+    <button id="run">▶ Run Live 50 Hz Emulation</button>
+    <label style="display:flex;align-items:center;gap:8px;margin-top:18px;cursor:pointer">
+      <input type="checkbox" id="soundOn" checked style="width:auto"> Alert sound (buzzer)
+    </label>
+    <button id="testSound" style="background:var(--panel2);color:var(--text);border:1px solid var(--line);margin-top:10px">🔊 Test sound</button>
+  </aside>
+
+  <section class="main">
+    <div class="card">
+      <h2>Simulated MPU-6050 Accelerometer Telemetry (50 Hz)</h2>
+      <div class="chartwrap"><canvas id="chart"></canvas></div>
+      <div class="legend">
+        <span><i style="background:var(--x)"></i>Acc X (g)</span>
+        <span><i style="background:var(--y)"></i>Acc Y (g)</span>
+        <span><i style="background:var(--z)"></i>Acc Z (g)</span>
+        <span><i style="background:var(--res)"></i>Resultant |a|</span>
+        <span><i style="background:var(--warn)"></i>Free-fall threshold (0.5 g)</span>
+      </div>
+      <div class="kpis">
+        <div class="kpi"><small>Min |a|</small><span id="kMin">–</span></div>
+        <div class="kpi"><small>Peak |a|</small><span id="kMax">–</span></div>
+        <div class="kpi"><small>Samples</small><span id="kN">0 / 50</span></div>
+        <div class="kpi"><small>Elapsed</small><span id="kT">0.00 s</span></div>
+      </div>
+    </div>
+
+    <div class="card stack">
+      <h2>On-Device Decision Telemetry</h2>
+      <div class="status idle" id="tier1">Tier 1 (Free-Fall Check): waiting for run…</div>
+
+      <div class="meter">
+        <div class="row"><span>Normal Movement Confidence</span></div>
+        <div class="val" id="pNormal">–</div>
+        <div class="bar"><div id="bNormal" style="background:var(--ok)"></div></div>
+      </div>
+      <div class="meter">
+        <div class="row"><span>Pre-Fall Instability Confidence</span></div>
+        <div class="val" id="pFall">–</div>
+        <div class="bar"><div id="bFall" style="background:var(--bad)"></div></div>
+      </div>
+
+      <div class="status info" id="latency">Inference Latency: – (Loop budget: 20 ms @ 50 Hz)</div>
+      <div class="status idle" id="verdict">STATUS: Standby</div>
+    </div>
+  </section>
+</div>
+
+<script>
+/* =========================  CONFIG & RUNTIME  ========================= */
+const CFG = {
+  fs: 50,
+  win: 50,
+  freeFallG: 0.5,
+  loopBudgetMs: 20,
+  fixedLatencyMs: 12.5
+};
+
+const $ = id => document.getElementById(id);
+const sc = $('scenario'), sm = $('sample'), runBtn =$('run');
+
+function fillSamples() {
+  const d = window.PREFALL_DATA;
+  if (d && d[sc.value]) {
+    const ids = Object.keys(d[sc.value]);
+    sm.innerHTML = ids.map(i => 
+      `<option value="${i}">${sc.value === 'fall' ? 'Fall Event #' : 'Normal ADL #'}${i}</option>`
+    ).join('');
+  }
+  reset();
+}
+
+sc.onchange = () => fillSamples();
+sm.onchange = reset;
+
+/* ---------- canvas chart ---------- */
+const cv = $('chart'), ctx = cv.getContext('2d');
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const mag = s => Math.hypot(s[0], s[1], s[2]);
+
+function draw(win, upto) {
+  const dpr = devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  cv.width = W * dpr; cv.height = H * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const L = 44, R = 14, T = 10, B = 32, pw = W - L - R, ph = H - T - B, ymin = -3, ymax = 3;
+  const X = i => L + i / (CFG.win - 1) * pw, Y = v => T + (ymax - v) / (ymax - ymin) * ph;
+  
+  ctx.clearRect(0, 0, W, H); ctx.font = '11px ' + css('--font'); ctx.fillStyle = css('--muted');
+  ctx.strokeStyle = css('--line'); ctx.lineWidth = 1; ctx.textAlign = 'right';
+  
+  for (let v = ymin; v <= ymax; v++) {
+    ctx.beginPath(); ctx.moveTo(L, Y(v)); ctx.lineTo(L + pw, Y(v)); ctx.stroke();
+    ctx.fillText(v, L - 8, Y(v) + 4);
+  }
+  ctx.textAlign = 'center';
+  for (let s = 0; s <= 1; s += .2) {
+    const i = s * CFG.fs;
+    ctx.fillText(s.toFixed(1), X(Math.min(i, CFG.win - 1)), H - 12);
+  }
+  ctx.fillText('Time Elapsed (seconds)', L + pw / 2, H);
+  ctx.save(); ctx.translate(12, T + ph / 2); ctx.rotate(-Math.PI / 2);
+  ctx.fillText('Acceleration (g)', 0, 0); ctx.restore();
+
+  // 0.5g Free-fall threshold dashed line
+  ctx.strokeStyle = css('--warn'); ctx.setLineDash([2, 5]); ctx.beginPath();
+  ctx.moveTo(L, Y(CFG.freeFallG)); ctx.lineTo(L + pw, Y(CFG.freeFallG)); ctx.stroke(); ctx.setLineDash([]);
+  
+  if (!win) return;
+  const line = (fn, col, dash, wd) => {
+    ctx.strokeStyle = css(col); ctx.lineWidth = wd || 1.8; ctx.setLineDash(dash || []);
+    ctx.beginPath();
+    for (let i = 0; i < upto; i++) {
+      const y = Y(fn(win[i]));
+      i ? ctx.lineTo(X(i), y) : ctx.moveTo(X(i), y);
+    }
+    ctx.stroke(); ctx.setLineDash([]);
+  };
+
+  line(s => s[0], '--x');
+  line(s => s[1], '--y');
+  line(s => s[2], '--z');
+  line(mag, '--res', [6, 4], 1.6);
+
+  if (upto > 0) {
+    ctx.strokeStyle = css('--muted'); ctx.globalAlpha = .4; ctx.beginPath();
+    ctx.moveTo(X(upto - 1), T); ctx.lineTo(X(upto - 1), T + ph); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+}
+
+/* ---------- Panels ---------- */
+function setStatus(el, cls, txt) { el.className = 'status ' + cls; el.textContent = txt; }
+
+function reset() {
+  draw(null, 0);
+  setStatus($('tier1'), 'idle', 'Tier 1 (Free-Fall Check): waiting for run…');
+  ['pNormal', 'pFall'].forEach(i => $(i).textContent = '–');
+  $('bNormal').style.width =$('bFall').style.width = '0';
+  setStatus($('latency'), 'info', `Inference Latency: – (Loop budget: ${CFG.loopBudgetMs} ms @ ${CFG.fs} Hz)`);
+  setStatus($('verdict'), 'idle', 'STATUS: Standby');$('verdict').classList.remove('alert', 'show');
+  $('kMin').textContent =$('kMax').textContent = '–';
+  $('kN').textContent = '0 / 50';$('kT').textContent = '0.00 s';
+}
+
+function showResult(item) {
+  const f = (item.p_fall * 100).toFixed(1) + '%';
+  const n = (item.p_normal * 100).toFixed(1) + '%';
+  $('pFall').textContent = f;
+  $('pNormal').textContent = n;
+  $('bFall').style.width = f;
+  $('bNormal').style.width = n;
+
+  setStatus($('tier1'), item.tier1 ? 'bad' : 'ok', item.tier1
+    ? `Tier 1 (Free-Fall Check): TRIGGERED (${item.min_a.toFixed(2)} g < ${CFG.freeFallG} g)`
+    : `Tier 1 (Free-Fall Check): STABLE (Min: ${item.min_a.toFixed(2)} g)`);
+
+  setStatus($('latency'), 'info', `Inference Latency: ~${CFG.fixedLatencyMs} ms (Edge Target: <20 ms @ 50 Hz)`);
+
+  if (item.p_fall >= 0.75 || item.tier1) {
+    setStatus($('verdict'), 'bad', `🚨 CRITICAL WARNING: PRE-FALL DETECTED! Haptic Actuator & Buzzer Fired (Lead Time: ~250 ms)`);
+    $('verdict').classList.add('alert', 'show');
+    playAlarm();
+  } else {
+    setStatus($('verdict'), 'ok', 'STATUS: NORMAL GAIT PROFILE · No Actuation Required');
+  }
+}
+
+/* ---------- Web Audio Alert ---------- */
+let audio = null;
+function unlockAudio() {
+  if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)();
+  if (audio.state === 'suspended') audio.resume();
+}
+
+function playAlarm(sweeps = 4) {
+  if (!$('soundOn').checked) return;
+  unlockAudio();
+  const SWEEP = 0.45, t0 = audio.currentTime + 0.02, end = t0 + sweeps * SWEEP;
+  const comp = audio.createDynamicsCompressor(), master = audio.createGain();
+  master.gain.value = 0.5; comp.connect(master).connect(audio.destination);
+
+  [['sawtooth', 1, 0.35], ['square', 0.5, 0.18]].forEach(([type, mult, vol]) => {
+    const o = audio.createOscillator(), g = audio.createGain();
+    o.type = type;
+    for (let i = 0; i < sweeps; i++) {
+      const s = t0 + i * SWEEP;
+      o.frequency.setValueAtTime(650 * mult, s);
+      o.frequency.exponentialRampToValueAtTime(1500 * mult, s + SWEEP * 0.9);
+    }
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(vol, t0 + 0.03);
+    g.gain.setValueAtTime(vol, end - 0.1);
+    g.gain.exponentialRampToValueAtTime(0.0001, end);
+    o.connect(g).connect(comp); o.start(t0); o.stop(end + 0.05);
+  });
+}
+$('testSound').onclick = () => playAlarm();
+
+/* ---------- 50 Hz Playback Loop ---------- */
+let timer = null;
+runBtn.onclick = () => {
+  if (timer) return;
+  const d = window.PREFALL_DATA;
+  if (!d || !d[sc.value] || !d[sc.value][sm.value]) return;
+
+  const item = d[sc.value][sm.value];
+  const win = item.window;
+
+  unlockAudio();
+  reset();
+  runBtn.disabled = true;
+
+  let i = 0;
+  timer = setInterval(() => {
+    i++;
+    draw(win, i);
+    const m = win.slice(0, i).map(mag);
+    $('kMin').textContent = Math.min(...m).toFixed(2) + ' g';
+    $('kMax').textContent = Math.max(...m).toFixed(2) + ' g';$('kN').textContent = `${i} / ${CFG.win}`;
+    $('kT').textContent = (i / CFG.fs).toFixed(2) + ' s';
+
+    if (i >= CFG.win) {
+      clearInterval(timer);
+      timer = null;
+      runBtn.disabled = false;
+      showResult(item);
+    }
+  }, 1000 / CFG.fs);
+};
+
+addEventListener('resize', () => reset());
+fillSamples();
+</script>
+</body>
+</html>
