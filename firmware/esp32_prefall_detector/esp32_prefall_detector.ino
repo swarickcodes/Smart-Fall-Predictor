@@ -1,162 +1,240 @@
 #include <Wire.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
 #include <EloquentTinyML.h>
 #include "model_data.h"
 
-// --- 1. PIN DEFINITIONS ---
-#define PIN_HAPTIC    6     // Drives 2N2222 transistor base for vibration motor
-#define PIN_BUZZER    7     // Active piezo buzzer pin
-#define I2C_SDA_PIN   8     // ESP32-S3 default I2C SDA
-#define I2C_SCL_PIN   9     // ESP32-S3 default I2C SCL
+// --- HARDWARE PIN ASSIGNMENTS ---
+#define PIN_FSR_HEEL   34  // Plantar Calcaneus (ADC1_CH6)
+#define PIN_FSR_INNER  35  // Plantar 1st Metatarsal (ADC1_CH7)
+#define PIN_FSR_OUTER  32  // Plantar 5th Metatarsal (ADC1_CH4)
+#define PIN_BUZZER     25  // Active Buzzer Drive Pin
+#define I2C_SDA_PIN    21  // MPU-6050 SDA
+#define I2C_SCL_PIN    22  // MPU-6050 SCL
 
-// --- 2. TIMING CONSTANTS ---
-#define SAMPLE_FREQ_HZ       50                      // 50 readings per second (matches ML training)
-#define SAMPLE_INTERVAL_MS   (1000 / SAMPLE_FREQ_HZ) // Exactly 20 ms per loop tick
-#define WINDOW_SIZE          50                      // 1.0 second sliding window (50 samples)
-#define STEP_SIZE            25                      // 50% overlap hop (0.5 second)
+#define MPU_ADDR       0x68
 
-// --- 3. TINYML ENGINE CONFIGURATION ---
-#define NUMBER_OF_INPUTS     (50 * 6)                // 50 timesteps * 6 IMU axes = 300 inputs
-#define NUMBER_OF_OUTPUTS    2                       // Class 0: Normal, Class 1: Pre-Fall
-#define TENSOR_ARENA_SIZE    (25 * 1024)             // 25 KB internal RAM allocated for ML math
+// --- TINYML CONFIGURATION ---
+#define NUMBER_OF_INPUTS   300 
+#define NUMBER_OF_OUTPUTS  1   // Raw linear logit output
+#define TENSOR_ARENA_SIZE  (20 * 1024)
 
-// Allocate TinyML runtime object
 Eloquent::TinyML::TfLite<NUMBER_OF_INPUTS, NUMBER_OF_OUTPUTS, TENSOR_ARENA_SIZE> ml;
 
-Adafruit_MPU6050 mpu;
+// Time-series ring buffer
+#define MODEL_TIMESTEPS 50
+#define MODEL_CHANNELS  6
+float ring_buffer[MODEL_TIMESTEPS][MODEL_CHANNELS];
+int ring_head = 0;
+bool buffer_primed = false;
 
-// Rolling sensor buffer: 50 rows, 6 columns [Ax, Ay, Az, Gx, Gy, Gz]
-float sensor_window[WINDOW_SIZE][6];
-int sample_counter = 0;
-unsigned long previous_sample_time = 0;
+// Flattened input tensor buffer
+float model_input[NUMBER_OF_INPUTS];
 
-// Flat 1D array fed directly into the model input tensor
-float ml_input_features[NUMBER_OF_INPUTS];
+// Sampling loop (25 Hz = 40 ms interval)
+constexpr unsigned long SAMPLE_INTERVAL_MS = 40;
+unsigned long last_sample_time = 0;
 
-// --- 4. ALERT FUNCTION ---
-void activate_alert() {
-    Serial.println("[ALERT] >>> PRE-FALL DETECTED! TRIGGERING ACTUATORS <<<");
-    digitalWrite(PIN_HAPTIC, HIGH); // Immediate tactile pulse (<10 ms response)
-    digitalWrite(PIN_BUZZER, HIGH); // Immediate acoustic chime
-    delay(250);                     // Buzz for 250 ms
-    digitalWrite(PIN_HAPTIC, LOW);
-    digitalWrite(PIN_BUZZER, LOW);
+// Buzzer Alarm timing
+bool alarm_active = false;
+unsigned long alarm_start_time = 0;
+constexpr unsigned long ALARM_DURATION_MS = 1500;
+
+// Conversion factors
+const float ACCEL_SCALE = (4.0f * 9.80665f) / 32768.0f; // +/- 4g scale
+const float FSR_SCALE   = 1.0f / 4095.0f;               // 12-bit ADC normalizer
+
+// --- KFALL BASELINE PRE-LOAD VALUES (ADL NORMAL STANCE) ---
+// [Ax, Ay, Az, Heel, Inner, Outer]
+const float KFALL_BASELINE_AX    = 0.12f;
+const float KFALL_BASELINE_AY    = 0.15f;
+const float KFALL_BASELINE_AZ    = 9.78f;  // Earth gravity component (1g)
+const float KFALL_BASELINE_HEEL  = 0.48f;  // Calcaneus weight distribution
+const float KFALL_BASELINE_INNER = 0.35f;  // 1st Metatarsal distribution
+const float KFALL_BASELINE_OUTER = 0.32f;  // 5th Metatarsal distribution
+
+void recoverI2CBus() {
+  pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+  pinMode(I2C_SCL_PIN, OUTPUT);
+
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(I2C_SCL_PIN, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(I2C_SCL_PIN, LOW);
+    delayMicroseconds(5);
+  }
+
+  pinMode(I2C_SDA_PIN, OUTPUT);
+  digitalWrite(I2C_SDA_PIN, LOW);
+  delayMicroseconds(5);
+  digitalWrite(I2C_SCL_PIN, HIGH);
+  delayMicroseconds(5);
+  digitalWrite(I2C_SDA_PIN, HIGH);
+  delayMicroseconds(5);
 }
 
-// --- 5. INITIALIZATION SETUP ---
+bool setupMPU() {
+  recoverI2CBus();
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(100000);
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0x00);
+  if (Wire.endTransmission(true) != 0) return false;
+  delay(15);
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x1C);
+  Wire.write(0x08); // +/- 4g range
+  if (Wire.endTransmission(true) != 0) return false;
+
+  return true;
+}
+
+bool readSensors(float &ax, float &ay, float &az, float &heel, float &inner, float &outer) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+  if (Wire.endTransmission(false) != 0) return false;
+
+  if (Wire.requestFrom((uint8_t)MPU_ADDR, (uint8_t)6, (uint8_t)true) == 6) {
+    int16_t raw_ax = (Wire.read() << 8) | Wire.read();
+    int16_t raw_ay = (Wire.read() << 8) | Wire.read();
+    int16_t raw_az = (Wire.read() << 8) | Wire.read();
+
+    ax = (float)raw_ax * ACCEL_SCALE;
+    ay = (float)raw_ay * ACCEL_SCALE;
+    az = (float)raw_az * ACCEL_SCALE;
+  } else {
+    return false;
+  }
+
+  heel  = (float)analogRead(PIN_FSR_HEEL)  * FSR_SCALE;
+  inner = (float)analogRead(PIN_FSR_INNER) * FSR_SCALE;
+  outer = (float)analogRead(PIN_FSR_OUTER) * FSR_SCALE;
+
+  return true;
+}
+
+// Pre-fill rolling buffer with KFall standing baseline
+void initializeBufferWithKFallBaseline() {
+  for (int t = 0; t < MODEL_TIMESTEPS; t++) {
+    ring_buffer[t][0] = KFALL_BASELINE_AX;
+    ring_buffer[t][1] = KFALL_BASELINE_AY;
+    ring_buffer[t][2] = KFALL_BASELINE_AZ;
+    ring_buffer[t][3] = KFALL_BASELINE_HEEL;
+    ring_buffer[t][4] = KFALL_BASELINE_INNER;
+    ring_buffer[t][5] = KFALL_BASELINE_OUTER;
+  }
+  ring_head = 0;
+  buffer_primed = true;
+}
+
+void triggerAlarm() {
+  alarm_active = true;
+  alarm_start_time = millis();
+  digitalWrite(PIN_BUZZER, HIGH);
+}
+
+void updateAlarm() {
+  if (alarm_active && (millis() - alarm_start_time >= ALARM_DURATION_MS)) {
+    digitalWrite(PIN_BUZZER, LOW);
+    alarm_active = false;
+  }
+}
+
 void setup() {
-    Serial.begin(115200);
-    while (!Serial && millis() < 3000); // Allow USB serial to link up
+  Serial.begin(115200);
+  while (!Serial && millis() < 3000);
 
-    Serial.println("\n--- Initializing ESP32-S3 Pre-Fall Detector ---");
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
 
-    // Configure Actuators
-    pinMode(PIN_HAPTIC, OUTPUT);
-    pinMode(PIN_BUZZER, OUTPUT);
-    digitalWrite(PIN_HAPTIC, LOW);
-    digitalWrite(PIN_BUZZER, LOW);
+  pinMode(PIN_FSR_HEEL, INPUT);
+  pinMode(PIN_FSR_INNER, INPUT);
+  pinMode(PIN_FSR_OUTER, INPUT);
 
-    // Initialize I2C communication on GPIO 8 and 9
-    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-    Wire.setClock(400000); // 400 kHz Fast-Mode I2C
+  analogSetPinAttenuation(PIN_FSR_HEEL, ADC_11db);
+  analogSetPinAttenuation(PIN_FSR_INNER, ADC_11db);
+  analogSetPinAttenuation(PIN_FSR_OUTER, ADC_11db);
 
-    // Initialize MPU-6050 IMU
-    if (!mpu.begin()) {
-        Serial.println("[ERROR] MPU-6050 not found! Check 3V3, GND, SDA, and SCL wiring.");
-        while (1) { delay(100); }
+  Serial.println("\n=============================================");
+  Serial.println("   Smart Insole Pre-Fall Prediction Engine   ");
+  Serial.printf("   Quantized Model Size: %d bytes\n", fall_model_quant_len);
+  Serial.println("=============================================");
+
+  if (!setupMPU()) {
+    Serial.println("[-] Error: MPU-6050 not detected at 0x68. Verify SDA/SCL lines.");
+    while (1) {
+      digitalWrite(PIN_BUZZER, HIGH); delay(80);
+      digitalWrite(PIN_BUZZER, LOW);  delay(250);
     }
-    Serial.println("[OK] MPU-6050 initialized.");
+  }
 
-    // Set Sensor Ranges matching our training conditions
-    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);   // ±8g range (impact headroom)
-    mpu.setGyroRange(MPU6050_RANGE_500_DEG);        // ±500 °/s range
-    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);     // Onboard low-pass filter at ~21 Hz
+  if (!ml.begin(fall_model_quant_tflite)) {
+    Serial.println("[-] Error: Failed to initialize TensorFlow Lite Model!");
+    while (1) delay(1000);
+  }
 
-    // Initialize the TinyML Inference Engine with model_data.h array
-    if (!ml.begin(fall_model_quant_tflite)) {
-        Serial.println("[ERROR] Failed to start TinyML engine. Check tensor arena size.");
-        while (1) { delay(100); }
-    }
-    Serial.println("[OK] TinyML INT8 Engine loaded successfully.");
-    Serial.println("[READY] System active. Sampling at 50 Hz...\n");
+  // Pre-seed buffer with normal KFall baseline stance
+  initializeBufferWithKFallBaseline();
+
+  Serial.println("[+] TensorFlow Lite Micro Initialized successfully.");
+  Serial.println("[+] Pre-seeded with KFall standing baseline.");
+  Serial.println("[+] Ready for live inference...\n");
 }
 
-// --- 6. REAL-TIME LOOP ---
 void loop() {
-    unsigned long current_time = millis();
+  unsigned long now = millis();
 
-    // Enforce exact 20 ms timer intervals (50 Hz)
-    if (current_time - previous_sample_time >= SAMPLE_INTERVAL_MS) {
-        previous_sample_time = current_time;
+  if (now - last_sample_time >= SAMPLE_INTERVAL_MS) {
+    last_sample_time = now;
 
-        // Poll sensor
-        sensors_event_t a, g, temp;
-        mpu.getEvent(&a, &g, &temp);
+    float ax, ay, az, heel, inner, outer;
+    if (readSensors(ax, ay, az, heel, inner, outer)) {
+      ring_buffer[ring_head][0] = ax;
+      ring_buffer[ring_head][1] = ay;
+      ring_buffer[ring_head][2] = az;
+      ring_buffer[ring_head][3] = heel;
+      ring_buffer[ring_head][4] = inner;
+      ring_buffer[ring_head][5] = outer;
 
-        // Record 6 axes into sliding buffer
-        sensor_window[sample_counter][0] = a.acceleration.x;
-        sensor_window[sample_counter][1] = a.acceleration.y;
-        sensor_window[sample_counter][2] = a.acceleration.z;
-        sensor_window[sample_counter][3] = g.gyro.x;
-        sensor_window[sample_counter][4] = g.gyro.y;
-        sensor_window[sample_counter][5] = g.gyro.z;
+      ring_head = (ring_head + 1) % MODEL_TIMESTEPS;
 
-        // --- TIER 1: FAST HEURISTIC THRESHOLD (Wu 2000 Baseline) ---
-        // During early loss of balance or free-fall drop, resultant acceleration collapses < 0.5g (< 4.9 m/s^2)
-        float total_acc = sqrt(sq(a.acceleration.x) + sq(a.acceleration.y) + sq(a.acceleration.z));
-        if (total_acc < 4.90f) {
-            Serial.print("[TIER 1 TRIGGER] Free-fall detected! Acceleration: ");
-            Serial.print(total_acc);
-            Serial.println(" m/s^2");
-            activate_alert();
-            sample_counter = 0; // Reset buffer
-            return;
+      // Flatten the 50x6 circular buffer into the 300-float input vector
+      int idx = 0;
+      for (int t = 0; t < MODEL_TIMESTEPS; t++) {
+        int ring_t = (ring_head + t) % MODEL_TIMESTEPS;
+        for (int c = 0; c < MODEL_CHANNELS; c++) {
+          model_input[idx++] = ring_buffer[ring_t][c];
         }
+      }
 
-        sample_counter++;
+      // --- INFERENCE FORWARD PASS ---
+      float model_output[NUMBER_OF_OUTPUTS] = {0.0f};
+      ml.predict(model_input, model_output);
 
-        // --- TIER 2: TINYML 1D-CNN INFERENCE ---
-        // Once 50 samples (1.0 second of motion) are gathered, run the neural network
-        if (sample_counter >= WINDOW_SIZE) {
-            unsigned long start_micros = micros();
+      // Hardware-native C++ Sigmoid conversion
+      float logit = model_output[0];
+      float pre_fall_prob = 1.0f / (1.0f + exp(-logit));
+      pre_fall_prob = constrain(pre_fall_prob, 0.0f, 1.0f);
 
-            // Flatten 2D window (50x6) into 1D array of 300 values
-            int flat_idx = 0;
-            for (int i = 0; i < WINDOW_SIZE; i++) {
-                for (int c = 0; c < 6; c++) {
-                    ml_input_features[flat_idx++] = sensor_window[i][c];
-                }
-            }
+      // Unloaded desk safeguard:
+      // If the insole is on a table with zero pressure applied, hold at baseline
+      float current_pressure = heel + inner + outer;
+      if (current_pressure < 0.05f) {
+        pre_fall_prob = 0.02f; // Idle / Unworn State
+      }
 
-            // Execute neural network on the ESP32-S3
-            float output[2] = {0.0f, 0.0f};
-            ml.predict(ml_input_features, output);
+      Serial.printf("Ax:%5.1f | Heel:%4d | Outer:%4d | Inner:%4d | NN_Prob:%.2f",
+                    ax, (int)(heel * 4095), (int)(outer * 4095), (int)(inner * 4095), pre_fall_prob);
 
-            unsigned long duration_us = micros() - start_micros;
-            float pre_fall_confidence = output[1]; // Index 1 is Class 1 (Pre-Fall)
-
-            // Print telemetry
-            Serial.print("[INFERENCE] Time: ");
-            Serial.print(duration_us / 1000.0);
-            Serial.print(" ms | Normal: ");
-            Serial.print(output[0] * 100.0, 1);
-            Serial.print("% | Pre-Fall: ");
-            Serial.print(pre_fall_confidence * 100.0, 1);
-            Serial.println("%");
-
-            // If model is >= 75% confident this is a pre-fall stumble, trigger alert
-            if (pre_fall_confidence >= 0.75f) {
-                activate_alert();
-            }
-
-            // 50% Overlap Shift: move the newest 25 samples to the start of the buffer
-            for (int i = 0; i < STEP_SIZE; i++) {
-                for (int c = 0; c < 6; c++) {
-                    sensor_window[i][c] = sensor_window[i + STEP_SIZE][c];
-                }
-            }
-            sample_counter = STEP_SIZE; // Ready to collect 25 more samples for next hop
-        }
+      if (pre_fall_prob >= 0.70f) {
+        Serial.println(" -> [!] PRE-FALL DETECTED!");
+        triggerAlarm();
+      } else {
+        Serial.println(" -> Normal Gait / Idle");
+      }
     }
+  }
+
+  updateAlarm();
 }
